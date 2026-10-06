@@ -13,18 +13,30 @@ def secret(name, default=None):
         return default
 
 
-# ---------- 비밀번호 잠금 ----------
-APP_PASSWORD = secret("APP_PASSWORD")
-if APP_PASSWORD and not st.session_state.get("authed"):
+# ---------- 로그인 ----------
+# Secrets의 [USERS] 표에 "아이디 = 비밀번호"로 등록된 사람만 들어올 수 있음.
+# 사람마다 아이디가 달라서 기록·추천이 서로 섞이지 않음.
+try:
+    USERS = {str(k): str(v) for k, v in dict(secret("USERS") or {}).items()}
+except Exception:
+    USERS = {}
+
+if not st.session_state.get("user_id"):
     st.title("📚 다음책")
+    if not USERS:
+        st.error("등록된 사용자가 없어요. Secrets에 [USERS]를 추가해 주세요.")
+        st.stop()
+    uid = st.text_input("아이디").strip()
     pw = st.text_input("비밀번호", type="password")
     if st.button("들어가기", type="primary"):
-        if pw == APP_PASSWORD:
-            st.session_state.authed = True
+        if uid in USERS and USERS[uid] == pw:
+            st.session_state.user_id = uid
             st.rerun()
         else:
-            st.error("비밀번호가 달라요.")
+            st.error("아이디나 비밀번호가 달라요.")
     st.stop()
+
+USER_ID = st.session_state.user_id
 
 
 @st.cache_resource
@@ -34,7 +46,7 @@ def get_sb():
 
 def get_rec(progress=None, config=None):
     return Recommender(get_sb(), secret("KAKAO_KEY"), secret("NARU_KEY"),
-                       user_id=secret("USER_ID", "hyeyeon"), config=config, progress=progress)
+                       user_id=USER_ID, config=config, progress=progress)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -67,7 +79,12 @@ st.session_state.setdefault("results", [])
 st.session_state.setdefault("warns", [])
 st.session_state.setdefault("hidden", set())
 
-st.title("📚 다음책")
+h1, h2 = st.columns([4, 1])
+h1.title("📚 다음책")
+h2.caption(f"{USER_ID}님")
+if h2.button("로그아웃"):
+    st.session_state.clear()
+    st.rerun()
 tab_rec, tab_add, tab_lib, tab_want = st.tabs(["추천받기", "책 기록하기", "내 서재", "읽고 싶은 책"])
 
 # ---------- 추천받기 ----------
