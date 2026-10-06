@@ -124,8 +124,17 @@ STOP = {"그리고", "하지만", "그러나", "이야기", "소설", "작가", 
 
 
 # ---------- 도우미 ----------
-def norm_title(t):
+def _clean(t):
     return re.sub(r"\(.*?\)|\[.*?\]|[^가-힣A-Za-z0-9]", "", t or "")
+
+
+def norm_title(t):
+    """판본이 달라도 같은 책이면 같은 값이 되도록 제목을 정리
+    예) '아몬드 :손원평 장편소설', '아몬드(100만 부 기념 특별판)' → '아몬드'"""
+    t = re.sub(r"\(.*?\)|\[.*?\]", "", t or "")
+    # 부제 구분자(앞이나 뒤에 공백이 있는 :, =, ;, -)에서 자르기. 'Re:제로'처럼 붙어 있으면 유지
+    main = _clean(re.split(r"\s+[:=;]|[:=;]\s+|\s+[-―–]\s+", t)[0])
+    return main if len(main) >= 2 else _clean(t)
 
 
 def norm_author(s):
@@ -296,12 +305,15 @@ class Recommender:
         return [{**(r.get("books") or {}), "isbn13": r["isbn13"],
                  "rating": to_rating(r["rating"]), "read_date": r.get("read_date")} for r in res.data]
 
-    def list_want(self):
+    def list_feedback(self, ftype):
         res = (self.sb.table("feedback")
                .select(f"isbn13, created_at, books({','.join(BOOK_COLS)})")
-               .eq("user_id", self.user_id).eq("type", "want")
+               .eq("user_id", self.user_id).eq("type", ftype)
                .order("created_at", desc=True).execute())
         return [{**(r.get("books") or {}), "isbn13": r["isbn13"]} for r in res.data]
+
+    def list_want(self):
+        return self.list_feedback("want")
 
     # ---------- DB: 추천용 ----------
     def load_my_books(self):

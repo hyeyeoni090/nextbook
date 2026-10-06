@@ -86,7 +86,8 @@ h2.caption(f"{USER_ID}님")
 if h2.button("로그아웃"):
     st.session_state.clear()
     st.rerun()
-tab_rec, tab_add, tab_lib, tab_want = st.tabs(["추천받기", "책 기록하기", "내 서재", "읽고 싶은 책"])
+tab_rec, tab_add, tab_lib, tab_want, tab_no = st.tabs(
+    ["추천받기", "책 기록하기", "내 서재", "읽고 싶은 책", "관심 없는 책"])
 
 # ---------- 추천받기 ----------
 with tab_rec:
@@ -226,4 +227,19 @@ with tab_want:
                     st.rerun()
             if w2.button("목록에서 빼기", key=f"wd_{isbn}", use_container_width=True):
                 get_rec().remove_feedback(isbn, "want")
+                st.rerun()
+
+# ---------- 관심 없는 책 ----------
+with tab_no:
+    nos = get_rec().list_feedback("not_interested")
+    st.caption(f"총 {len(nos)}권 · 여기 있는 책(다른 판본 포함)은 추천에 나오지 않아요")
+    for b in nos:
+        isbn = b["isbn13"]
+        with st.container(border=True):
+            c1, c2 = st.columns([1, 4])
+            thumb(c1, b)
+            book_header(c2, b)
+            if c2.button("되돌리기 (다시 추천 받기)", key=f"nd_{isbn}"):
+                get_rec().remove_feedback(isbn, "not_interested")
+                st.toast(f"다시 추천 후보가 돼요: {b.get('title')}")
                 st.rerun()
