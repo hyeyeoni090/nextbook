@@ -59,6 +59,9 @@ DEFAULTS = {
     "MIN_PER_GENRE": 1,                   # '내 취향 우선' 모드에서 장르마다 최소 권수
 }
 
+FEW_BOOKS = 5   # 기록이 이보다 적으면 인기 대출 순위를 섞어서 추천
+COLD_GENRES = ["소설(전체)", "에세이", "사회과학", "심리학", "인생·처세"]  # 기록 없을 때 '전체' 모드 장르
+
 GENRES = {  # 도서관 분류번호(KDC) 기준
     # 문학
     "소설(전체)":   {"kdc": "8", "class_re": r"^8\d3"},
@@ -399,7 +402,7 @@ class Recommender:
         self.progress("내 기록 불러오는 중...")
         u = self.prepare()
         if not u:
-            return [], ["먼저 '책 기록하기' 탭에서 읽은 책을 기록해 주세요."]
+            return self.recommend_popular([], top_n)
         self.progress("함께 대출된 책 찾는 중...")
         collab, cands = self.get_collab(u["weight"])
         self.progress("비슷한 책 검색 중...")
@@ -483,8 +486,9 @@ class Recommender:
         self.progress("내 기록 불러오는 중...")
         u = self.prepare()
         if not u:
-            return [], ["먼저 '책 기록하기' 탭에서 읽은 책을 기록해 주세요."]
+            return self.recommend_popular(names, top_n)
         warnings = []
+        few = len(u["mine"]) < FEW_BOOKS
         cands, pop, src = {}, Counter(), {}
         for g in names:
             self.progress(f"'{g}' 후보 모으는 중...")
@@ -508,7 +512,11 @@ class Recommender:
         tags = {k: matched(k, v) for k, v in cands.items()}
         cands = {k: v for k, v in cands.items() if tags[k]}
 
-        raw_k = {k: collab.get(k, 0) + cfg["POP_WEIGHT"] * pop[k] for k in cands}
+        pop_w = max(cfg["POP_WEIGHT"], 0.5) if few else cfg["POP_WEIGHT"]
+        if few:
+            warnings.append(f"기록이 {FEW_BOOKS}권 미만이라 인기 대출 순위를 함께 반영했어요. "
+                            "기록이 늘수록 취향 맞춤 추천이 강해져요.")
+        raw_k = {k: collab.get(k, 0) + pop_w * pop[k] for k in cands}
         pool = self.make_pool(cands, u, raw_k)
         if not pool:
             return [], ["추천 후보가 없어요."]
@@ -558,3 +566,50 @@ class Recommender:
             tag = "/".join(g for g in names if g in tags[b["isbn13"]])
             results.append(self._result(b, tag, final[i], c[i], k[i], is_new(i)))
         return results, warnings
+
+    # ---------- 기록이 없는 신규 사용자: 인기 대출 순 추천 ----------
+    def recommend_popular(self, names, top_n=10):
+        cfg = self.cfg
+        names = [g for g in dict.fromkeys(names or COLD_GENRES) if g in GENRES]
+        skip = self.load_feedback()
+        cands, lists = {}, {}
+        for g in names:
+            self.progress(f"'{g}' 인기 도서 모으는 중...")
+            gcfg = GENRES[g]
+            pop = self.naru_popular(gcfg, pages=gcfg.get("pages", cfg["GENRE_PAGES"]),
+                                    days=cfg["GENRE_DAYS"], age=cfg["GENRE_AGE"])
+            # 키워드로 거르는 세부 장르는 넉넉히, 나머지는 상위권만 살펴봄
+            pop = [b for b in pop if b["isbn13"] not in skip][:300 if gcfg.get("keywords") else 60]
+            lists[g] = pop
+            for b in pop:
+                cands.setdefault(b["isbn13"], b)
+        if not cands:
+            return [], ["인기 도서를 못 가져왔어요. 잠시 후 다시 시도해 주세요."]
+        self.fill_contents(cands)
+
+        def fits(g, b):
+            kws = GENRES[g].get("keywords")
+            t = f"{b.get('title') or ''} {b.get('contents') or ''}"
+            return not kws or any(kw in t for kw in kws)
+
+        queues = {g: [cands[b["isbn13"]] for b in lst if fits(g, cands[b["isbn13"]])]
+                  for g, lst in lists.items()}
+        picked, taken, cnt = [], set(), Counter()
+        # 장르를 돌아가며 인기 순으로 한 권씩
+        while len(picked) < top_n and any(queues.values()):
+            for g in names:
+                q = queues[g]
+                while q:
+                    b = q.pop(0)
+                    nt, a = norm_title(b.get("title")), author_of(b)
+                    if not nt or nt in taken or cnt[a] >= cfg["MAX_PER_AUTHOR"]:
+                        continue
+                    taken.add(nt)
+                    cnt[a] += 1
+                    picked.append(self._result(b, g))
+                    break
+                if len(picked) >= top_n:
+                    break
+        note = (f"아직 기록이 없어서 {cfg['GENRE_AGE'] + '대 ' if cfg['GENRE_AGE'] else ''}"
+                "도서관 인기 대출 순으로 골랐어요. '책 기록하기'에서 읽은 책을 남기면 취향 맞춤 추천으로 바뀌어요.")
+        return picked, [note]
