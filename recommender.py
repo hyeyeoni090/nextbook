@@ -4,7 +4,10 @@
 - Supabase: 읽은 책 기록, 피드백, 책 정보 캐시
 """
 import re
+import threading
+import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
 import numpy as np
@@ -14,6 +17,32 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 BOOK_COLS = ["isbn13", "title", "authors", "publisher", "thumbnail", "contents"]
+WORKERS = 8  # 동시에 보내는 API 요청 수
+
+# ---------- 서버 메모리 캐시 (같은 요청은 일정 시간 동안 다시 보내지 않음) ----------
+_CACHE, _LOCK = {}, threading.Lock()
+
+
+def cached(key, ttl, fn):
+    now = time.time()
+    with _LOCK:
+        hit = _CACHE.get(key)
+        if hit and now - hit[0] < ttl:
+            return hit[1]
+    val = fn()
+    if val:  # 빈 결과(오류 포함)는 저장하지 않음
+        with _LOCK:
+            _CACHE[key] = (now, val)
+    return val
+
+
+def pmap(fn, items, workers=WORKERS):
+    """여러 요청을 동시에 보내고, 결과는 입력 순서대로 돌려줌"""
+    items = list(items)
+    if len(items) <= 1:
+        return [fn(x) for x in items]
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(fn, items))
 
 # ===== 기본 설정 =====
 DEFAULTS = {
@@ -136,6 +165,10 @@ class Recommender:
 
     # ---------- 외부 API ----------
     def kakao_search(self, query, target=None, size=10):
+        return cached(("kakao", query, target, size), 86400,
+                      lambda: self._kakao_search(query, target, size))
+
+    def _kakao_search(self, query, target=None, size=10):
         params = {"query": query, "size": size}
         if target:
             params["target"] = target
@@ -157,6 +190,10 @@ class Recommender:
         return out
 
     def naru_recommend(self, isbn13, n=10):
+        return cached(("naru_rec", isbn13, n), 3 * 86400,
+                      lambda: self._naru_recommend(isbn13, n))
+
+    def _naru_recommend(self, isbn13, n=10):
         try:
             r = requests.get("http://data4library.kr/api/recommandList",
                              params={"authKey": self.naru_key, "isbn13": isbn13, "format": "json"},
@@ -173,19 +210,26 @@ class Recommender:
         return out
 
     def naru_popular(self, gcfg, pages=2, days=365, age=""):
+        key = ("naru_pop", gcfg["kdc"], gcfg.get("class_re"), pages, days, age, date.today().isoformat())
+        return cached(key, 86400, lambda: self._naru_popular(gcfg, pages, days, age))
+
+    def _naru_popular(self, gcfg, pages, days, age):
         end = date.today()
         start = end - timedelta(days=days)
-        out, seen = [], set()
-        for page in range(1, pages + 1):
+
+        def fetch(page):
             params = {"authKey": self.naru_key, "startDt": start.isoformat(), "endDt": end.isoformat(),
                       "kdc": gcfg["kdc"], "pageNo": page, "pageSize": 100, "format": "json"}
             if age:
                 params["age"] = age
             try:
-                r = requests.get("http://data4library.kr/api/loanItemSrch", params=params, timeout=15)
-                docs = r.json().get("response", {}).get("docs", [])
+                r = requests.get("http://data4library.kr/api/loanItemSrch", params=params, timeout=20)
+                return r.json().get("response", {}).get("docs", [])
             except Exception:
-                break
+                return []
+
+        out, seen = [], set()
+        for docs in pmap(fetch, range(1, pages + 1), workers=5):
             if not docs:
                 break
             for x in docs:
@@ -276,13 +320,17 @@ class Recommender:
                 cands[r["isbn13"]] = {**cands[r["isbn13"]], **r}
         todo = [k for k in need if "contents" not in cands[k]]
         new_rows = []
-        for n, k in enumerate(todo, 1):
-            if n % 20 == 0:
-                self.progress(f"책 정보 모으는 중... {n}/{len(todo)}")
-            d = self.fill_details(cands[k])
-            d["isbn13"] = k
-            cands[k] = {**cands[k], **d}
-            new_rows.append({c: d.get(c) for c in BOOK_COLS})
+        if todo:
+            with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                futs = {ex.submit(self.fill_details, cands[k]): k for k in todo}
+                for n, f in enumerate(as_completed(futs), 1):
+                    k = futs[f]
+                    d = f.result()
+                    d["isbn13"] = k
+                    cands[k] = {**cands[k], **d}
+                    new_rows.append({c: d.get(c) for c in BOOK_COLS})
+                    if n % 20 == 0:
+                        self.progress(f"책 정보 모으는 중... {n}/{len(todo)}")
         for i in range(0, len(new_rows), 200):
             self.sb.table("books").upsert(new_rows[i:i + 200]).execute()
 
@@ -301,8 +349,10 @@ class Recommender:
 
     def get_collab(self, weight):
         collab, cands = Counter(), {}
-        for isbn, wt in weight.items():
-            for rank, b in enumerate(self.naru_recommend(isbn), 1):
+        items = list(weight.items())
+        lists = pmap(lambda it: self.naru_recommend(it[0]), items, workers=5)
+        for (isbn, wt), recs in zip(items, lists):
+            for rank, b in enumerate(recs, 1):
                 collab[b["isbn13"]] += wt / np.sqrt(rank)
                 cands.setdefault(b["isbn13"], b)
         return collab, cands
@@ -354,11 +404,10 @@ class Recommender:
         collab, cands = self.get_collab(u["weight"])
         self.progress("비슷한 책 검색 중...")
         liked = u["liked"]
-        for a in {a for s in liked["authors"] for a in s.split(", ") if a}:
-            for b in self.kakao_search(a, target="person"):
-                cands.setdefault(b["isbn13"], b)
-        for kw in keywords_from(liked["contents"].tolist()):
-            for b in self.kakao_search(kw):
+        queries = ([(a, "person") for a in sorted({a for s in liked["authors"] for a in s.split(", ") if a})]
+                   + [(kw, None) for kw in keywords_from(liked["contents"].tolist())])
+        for found in pmap(lambda q: self.kakao_search(q[0], target=q[1]), queries):
+            for b in found:
                 cands.setdefault(b["isbn13"], b)
         cands = {k: v for k, v in cands.items() if k not in u["skip"]}
         self.fill_contents(cands)
