@@ -44,9 +44,9 @@ def get_sb():
     return create_client(secret("SUPABASE_URL"), secret("SUPABASE_KEY"))
 
 
-def get_rec(progress=None, config=None):
+def get_rec(progress=None, config=None, exclude=None):
     return Recommender(get_sb(), secret("KAKAO_KEY"), secret("NARU_KEY"),
-                       user_id=USER_ID, config=config, progress=progress)
+                       user_id=USER_ID, config=config, progress=progress, exclude=exclude)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -78,6 +78,7 @@ def thumb(col, b):
 st.session_state.setdefault("results", [])
 st.session_state.setdefault("warns", [])
 st.session_state.setdefault("hidden", set())
+st.session_state.setdefault("shown", {})  # 이번 접속에서 이미 추천받은 책 {isbn: 책}
 
 h1, h2 = st.columns([4, 1])
 h1.title("📚 다음책")
@@ -96,11 +97,14 @@ with tab_rec:
     with st.expander("세부 설정"):
         w_content = st.slider("책 소개 비중 (나머지는 대출 데이터)", 0.0, 1.0, 0.5, 0.1)
         max_author = st.slider("한 작가당 최대 권수", 1, 5, 2)
+    fresh = st.toggle("이번에 이미 본 책은 빼고 새 책으로", value=True,
+                      help="끄면 다시 눌렀을 때 같은 순위의 책이 그대로 나와요. 다시 로그인하면 초기화돼요.")
 
     if st.button("추천 받기", type="primary", use_container_width=True):
         status = st.status("추천 준비 중...", expanded=False)
         rec = get_rec(progress=lambda m: status.update(label=m),
-                      config={"W_CONTENT": w_content, "MAX_PER_AUTHOR": max_author})
+                      config={"W_CONTENT": w_content, "MAX_PER_AUTHOR": max_author},
+                      exclude=list(st.session_state.shown.values()) if fresh else None)
         try:
             if genres:
                 results, warns = rec.recommend_genre(genres, balanced=balanced)
@@ -109,6 +113,10 @@ with tab_rec:
             st.session_state.results = results
             st.session_state.warns = warns
             st.session_state.hidden = set()
+            for b in results:
+                st.session_state.shown[b["isbn13"]] = {"isbn13": b["isbn13"], "title": b.get("title")}
+            if fresh and not results:
+                st.session_state.warns = warns + ["새로 보여줄 책이 없어요. 위 스위치를 끄면 이전 추천을 다시 볼 수 있어요."]
             status.update(label="추천 완료!", state="complete")
         except Exception as e:
             status.update(label="오류가 났어요", state="error")

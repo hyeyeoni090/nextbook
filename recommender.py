@@ -158,13 +158,18 @@ def to_rating(v):
 
 
 class Recommender:
-    def __init__(self, sb, kakao_key, naru_key, user_id="hyeyeon", config=None, progress=None):
+    def __init__(self, sb, kakao_key, naru_key, user_id="hyeyeon", config=None, progress=None,
+                 exclude=None):
         self.sb = sb
         self.kakao_key = kakao_key
         self.naru_key = naru_key
         self.user_id = user_id
         self.cfg = {**DEFAULTS, **(config or {})}
         self.progress = progress or (lambda msg: None)
+        # exclude: 이번에 빼고 싶은 책들 (예: 이번 접속에서 이미 추천받은 책)
+        exclude = list(exclude or [])
+        self.ex_isbns = {b.get("isbn13") for b in exclude if b.get("isbn13")}
+        self.ex_titles = {norm_title(b.get("title")) for b in exclude} - {""}
 
     # ---------- 외부 API ----------
     def kakao_search(self, query, target=None, size=10):
@@ -311,8 +316,12 @@ class Recommender:
         return pd.DataFrame(rows)
 
     def load_feedback(self):
-        res = self.sb.table("feedback").select("isbn13").eq("user_id", self.user_id).execute()
-        return {r["isbn13"] for r in res.data}
+        """피드백 준 책의 ISBN과 제목 (같은 책의 다른 판본도 거르기 위해 제목도 사용)"""
+        res = (self.sb.table("feedback").select("isbn13, books(title)")
+               .eq("user_id", self.user_id).execute())
+        isbns = {r["isbn13"] for r in res.data}
+        titles = {norm_title((r.get("books") or {}).get("title")) for r in res.data}
+        return isbns | self.ex_isbns, (titles | self.ex_titles) - {""}
 
     def fill_contents(self, cands):
         need = [k for k, v in cands.items() if "contents" not in v]
@@ -345,10 +354,13 @@ class Recommender:
         liked = mine[mine["rating"].fillna(3) >= 3.5]
         if liked.empty:
             liked = mine
+        fb_isbns, fb_titles = self.load_feedback()
         return {"mine": mine, "liked": liked,
                 "weight": dict(zip(liked["isbn13"], (liked["rating"].fillna(3) - 2.5).clip(lower=0.5))),
                 "read_authors": {norm_author(a) for s in mine["authors"] for a in s.split(", ") if a},
-                "skip": set(mine["isbn13"]) | self.load_feedback()}
+                "skip": set(mine["isbn13"]) | fb_isbns,
+                # 읽은 책·피드백 준 책·이미 본 책의 제목 → 다른 판본도 제외
+                "skip_titles": {norm_title(t) for t in mine["title"]} | fb_titles}
 
     def get_collab(self, weight):
         collab, cands = Counter(), {}
@@ -361,7 +373,7 @@ class Recommender:
         return collab, cands
 
     def make_pool(self, cands, u, raw_k):
-        seen = {norm_title(t) for t in u["mine"]["title"]}
+        seen = set(u["skip_titles"])
         pool = []
         for b in sorted(cands.values(), key=lambda b: -raw_k.get(b["isbn13"], 0)):
             if b["isbn13"] in u["skip"]:
@@ -429,7 +441,7 @@ class Recommender:
 
         if n_topic:
             self.progress("관심 분야 찾는 중...")
-            taken = ({norm_title(t) for t in u["mine"]["title"]}
+            taken = (set(u["skip_titles"])
                      | {norm_title(pool[i]["title"]) for i in picked})
             lists = {g: self.naru_popular(GENRES[g], age=cfg["AGE"]) for g in topic_genres}
             topic = []
@@ -571,7 +583,7 @@ class Recommender:
     def recommend_popular(self, names, top_n=10):
         cfg = self.cfg
         names = [g for g in dict.fromkeys(names or COLD_GENRES) if g in GENRES]
-        skip = self.load_feedback()
+        skip, skip_titles = self.load_feedback()
         cands, lists = {}, {}
         for g in names:
             self.progress(f"'{g}' 인기 도서 모으는 중...")
@@ -594,7 +606,7 @@ class Recommender:
 
         queues = {g: [cands[b["isbn13"]] for b in lst if fits(g, cands[b["isbn13"]])]
                   for g, lst in lists.items()}
-        picked, taken, cnt = [], set(), Counter()
+        picked, taken, cnt = [], set(skip_titles), Counter()
         # 장르를 돌아가며 인기 순으로 한 권씩
         while len(picked) < top_n and any(queues.values()):
             for g in names:
