@@ -98,13 +98,15 @@ with tab_rec:
     with st.expander("세부 설정"):
         w_content = st.slider("책 소개 비중 (나머지는 대출 데이터)", 0.0, 1.0, 0.5, 0.1)
         max_author = st.slider("한 작가당 최대 권수", 1, 5, 2)
+        include_kids = st.toggle("아동 도서(동화 등)도 포함", value=False)
     fresh = st.toggle("이번에 이미 본 책은 빼고 새 책으로", value=True,
                       help="끄면 다시 눌렀을 때 같은 순위의 책이 그대로 나와요. 다시 로그인하면 초기화돼요.")
 
     if st.button("추천 받기", type="primary", use_container_width=True):
         status = st.status("추천 준비 중...", expanded=False)
         rec = get_rec(progress=lambda m: status.update(label=m),
-                      config={"W_CONTENT": w_content, "MAX_PER_AUTHOR": max_author},
+                      config={"W_CONTENT": w_content, "MAX_PER_AUTHOR": max_author,
+                              "INCLUDE_KIDS": include_kids},
                       exclude=list(st.session_state.shown.values()) if fresh else None)
         try:
             if genres:

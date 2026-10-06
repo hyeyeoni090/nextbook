@@ -47,6 +47,8 @@ def pmap(fn, items, workers=WORKERS):
 # ===== 기본 설정 =====
 DEFAULTS = {
     "W_CONTENT": 0.5,                     # 콘텐츠 비중 (0~1). 나머지는 대출 데이터 비중
+    "NEG_WEIGHT": 0.6,                    # '관심 없어요' 책과 비슷한 책을 얼마나 깎을지 (0 = 안 깎음)
+    "INCLUDE_KIDS": False,                # 아동 도서(동화 등) 포함 여부
     "MAX_PER_AUTHOR": 2,                  # 한 작가당 최대 추천 권수
     "NEW_AUTHOR_SLOTS": 3,                # 안 읽어본 작가 책 최소 권수
     "TOPIC_SLOTS": 3,                     # '전체' 모드에서 관심 분야 권수
@@ -162,6 +164,15 @@ def keywords_from(texts, n=10):
     return [w for w, _ in Counter(words).most_common(n)]
 
 
+def is_kids(d):
+    """도서관 데이터로 아동 도서인지 판단
+    - ISBN 부가기호 첫 자리: 7 = 아동, 6 = 초등 학습참고서
+    - 분류번호 8x3.8 = 아동 문학(동화)"""
+    add = str(d.get("addition_symbol") or "").strip()
+    cls = str(d.get("class_no") or "").strip()
+    return add[:1] in ("6", "7") or bool(re.match(r"^8\d3\.8", cls))
+
+
 def to_rating(v):
     return float(v) if v is not None else None
 
@@ -207,8 +218,8 @@ class Recommender:
         return out
 
     def naru_recommend(self, isbn13, n=10):
-        return cached(("naru_rec", isbn13, n), 3 * 86400,
-                      lambda: self._naru_recommend(isbn13, n))
+        return self._drop_kids(cached(("naru_rec", isbn13, n), 3 * 86400,
+                                      lambda: self._naru_recommend(isbn13, n)))
 
     def _naru_recommend(self, isbn13, n=10):
         try:
@@ -223,12 +234,19 @@ class Recommender:
             b = d.get("book", {})
             isbn = (b.get("isbn13") or "").strip()
             if len(isbn) == 13:
-                out.append({"isbn13": isbn, "title": b.get("bookname", ""), "authors": b.get("authors", "")})
+                out.append({"isbn13": isbn, "title": b.get("bookname", ""), "authors": b.get("authors", ""),
+                            "kids": is_kids(b)})
         return out
+
+    def _drop_kids(self, books):
+        if self.cfg["INCLUDE_KIDS"]:
+            return books
+        return [b for b in books if not b.get("kids")]
 
     def naru_popular(self, gcfg, pages=2, days=365, age=""):
         key = ("naru_pop", gcfg["kdc"], gcfg.get("class_re"), pages, days, age, date.today().isoformat())
-        return cached(key, 86400, lambda: self._naru_popular(gcfg, pages, days, age))
+        books = self._drop_kids(cached(key, 86400, lambda: self._naru_popular(gcfg, pages, days, age)))
+        return [{**b, "rank": i} for i, b in enumerate(books, 1)]
 
     def _naru_popular(self, gcfg, pages, days, age):
         end = date.today()
@@ -259,7 +277,7 @@ class Recommender:
                     continue
                 seen.add(isbn)
                 out.append({"isbn13": isbn, "title": d.get("bookname", ""),
-                            "authors": d.get("authors", ""), "rank": len(out) + 1})
+                            "authors": d.get("authors", ""), "kids": is_kids(d)})
         return out
 
     def fill_details(self, b):
@@ -329,10 +347,12 @@ class Recommender:
 
     def load_feedback(self):
         """피드백 준 책의 ISBN과 제목 (같은 책의 다른 판본도 거르기 위해 제목도 사용)"""
-        res = (self.sb.table("feedback").select("isbn13, books(title)")
+        res = (self.sb.table("feedback").select("isbn13, type, books(title, authors, contents)")
                .eq("user_id", self.user_id).execute())
         isbns = {r["isbn13"] for r in res.data}
         titles = {norm_title((r.get("books") or {}).get("title")) for r in res.data}
+        # '관심 없어요' 책들은 학습용으로 따로 보관
+        self.neg_books = [r.get("books") or {} for r in res.data if r.get("type") == "not_interested"]
         return isbns | self.ex_isbns, (titles | self.ex_titles) - {""}
 
     def fill_contents(self, cands):
@@ -401,16 +421,38 @@ class Recommender:
 
     def score(self, pool, u, raw_k):
         liked, weight = u["liked"], u["weight"]
+        neg = [b for b in getattr(self, "neg_books", []) if b.get("title") or b.get("contents")]
         text = lambda d: f"{d.get('title') or ''} {d.get('contents') or ''}"
         vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3))
-        X = vec.fit_transform([text(r) for _, r in liked.iterrows()] + [text(b) for b in pool])
-        L, C = X[:len(liked)], X[len(liked):]
+        X = vec.fit_transform([text(r) for _, r in liked.iterrows()] + [text(b) for b in pool]
+                              + [text(b) for b in neg])
+        nL, nP = len(liked), len(pool)
+        L, C, N = X[:nL], X[nL:nL + nP], X[nL + nP:]
         w = np.array([weight[i] for i in liked["isbn13"]]).reshape(-1, 1)
         profile = np.asarray(L.multiply(w).sum(axis=0)) / w.sum()
-        c = minmax(cosine_similarity(C, profile).ravel())
+        pos = cosine_similarity(C, profile).ravel()
+
+        # '관심 없어요' 학습: 관심 없다고 한 책들과 비슷할수록 내용 점수를 깎음
+        NEGW = self.cfg["NEG_WEIGHT"]
+        if neg and NEGW > 0:
+            neg_sim = cosine_similarity(C, np.asarray(N.mean(axis=0))).ravel()
+        else:
+            neg_sim = np.zeros(nP)
+        c = minmax(pos - NEGW * neg_sim)
         k = minmax([raw_k.get(b["isbn13"], 0) for b in pool])
         W = self.cfg["W_CONTENT"]
-        return W * c + (1 - W) * k, c, k
+        final = W * c + (1 - W) * k
+
+        if neg and NEGW > 0:
+            neg_authors = {norm_author(b.get("authors")) for b in neg} - {""}
+            for i, b in enumerate(pool):
+                # 좋아한 책들보다 관심 없는 책들에 더 가까우면 크게 감점
+                if neg_sim[i] > pos[i]:
+                    final[i] *= 1 - NEGW
+                # 관심 없다고 한 책의 작가 책도 감점
+                if norm_author(b.get("authors")) in neg_authors:
+                    final[i] *= 1 - NEGW / 2
+        return final, c, k
 
     def _result(self, b, tag=None, score=None, c=None, k=None, is_new=False):
         out = {col: b.get(col) for col in BOOK_COLS}
