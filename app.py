@@ -1,4 +1,11 @@
+import hashlib
+import hmac
+import re
+import secrets as pysecrets
+import json
+
 import streamlit as st
+from streamlit_js_eval import streamlit_js_eval
 from supabase import create_client
 
 from recommender import GENRES, Recommender
@@ -13,35 +20,89 @@ def secret(name, default=None):
         return default
 
 
-# ---------- 로그인 ----------
-# Secrets의 [USERS] 표에 "아이디 = 비밀번호"로 등록된 사람만 들어올 수 있음.
-# 사람마다 아이디가 달라서 기록·추천이 서로 섞이지 않음.
+@st.cache_resource
+def get_sb():
+    return create_client(secret("SUPABASE_URL"), secret("SUPABASE_KEY"))
+
+
+# ---------- 계정 ----------
+# 1) Secrets의 [USERS] (관리자 계정, 기존 계정)
+# 2) Supabase app_users 테이블 (사이트의 '회원 관리'에서 등록한 계정, 비밀번호는 암호화해서 저장)
 try:
-    USERS = {str(k): str(v) for k, v in dict(secret("USERS") or {}).items()}
+    SECRET_USERS = {str(k): str(v) for k, v in dict(secret("USERS") or {}).items()}
 except Exception:
-    USERS = {}
+    SECRET_USERS = {}
+ADMINS = set(str(secret("ADMINS", "hyeyeon")).replace(" ", "").split(","))
+ID_RE = re.compile(r"^[a-z0-9_]{2,20}$")
+
+
+def hash_pw(pw, salt=None):
+    salt = salt or pysecrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 200_000).hex()
+    return f"{salt}${h}"
+
+
+def check_pw(pw, stored):
+    try:
+        salt, _ = stored.split("$", 1)
+    except ValueError:
+        return False
+    return hmac.compare_digest(hash_pw(pw, salt), stored)
+
+
+def db_users():
+    """사이트에서 등록한 계정 목록. 테이블이 아직 없으면 None"""
+    try:
+        res = get_sb().table("app_users").select("user_id, pw_hash, created_at").order("created_at").execute()
+        return {r["user_id"]: r for r in res.data}
+    except Exception:
+        return None
+
+
+def login_ok(uid, pw):
+    if uid in SECRET_USERS:
+        return hmac.compare_digest(SECRET_USERS[uid], pw)
+    row = (db_users() or {}).get(uid)
+    return bool(row) and check_pw(pw, row["pw_hash"])
+
+
+def set_password(uid, pw):
+    get_sb().table("app_users").upsert({"user_id": uid, "pw_hash": hash_pw(pw)}).execute()
+
+
+# ---------- 로그인 (아이디 저장) ----------
+# '아이디 저장'을 켜면 이 브라우저(localStorage)에 아이디만 저장해서 다음에 자동으로 채워줌.
+# 비밀번호는 저장하지 않음.
+SAVED_ID_KEY = "nextbook_saved_id"
 
 if not st.session_state.get("user_id"):
     st.title("📚 다음책")
-    if not USERS:
-        st.error("등록된 사용자가 없어요. Secrets에 [USERS]를 추가해 주세요.")
-        st.stop()
-    uid = st.text_input("아이디").strip()
-    pw = st.text_input("비밀번호", type="password")
-    if st.button("들어가기", type="primary"):
-        if uid in USERS and USERS[uid] == pw:
+    saved = streamlit_js_eval(js_expressions=f"localStorage.getItem('{SAVED_ID_KEY}') || ''",
+                              key="read_saved_id")
+    saved = saved if isinstance(saved, str) and ID_RE.match(saved) else ""
+    with st.form("login"):
+        uid = st.text_input("아이디", value=saved, key=f"uid_{saved}", autocomplete="username").strip().lower()
+        pw = st.text_input("비밀번호", type="password", autocomplete="current-password")
+        remember = st.checkbox("아이디 저장", value=bool(saved), key=f"remember_{saved}")
+        ok = st.form_submit_button("들어가기", type="primary", use_container_width=True)
+    if ok:
+        if uid and pw and login_ok(uid, pw):
             st.session_state.user_id = uid
+            st.session_state.save_id = uid if remember else ""
             st.rerun()
         else:
             st.error("아이디나 비밀번호가 달라요.")
     st.stop()
 
+# 로그인 직후 한 번만: 아이디를 브라우저에 저장하거나 지움
+if "save_id" in st.session_state:
+    sid = st.session_state.pop("save_id")
+    js = (f"localStorage.setItem('{SAVED_ID_KEY}', {json.dumps(sid)})" if sid
+          else f"localStorage.removeItem('{SAVED_ID_KEY}')")
+    streamlit_js_eval(js_expressions=js, key=f"write_saved_id_{sid}")
+
 USER_ID = st.session_state.user_id
-
-
-@st.cache_resource
-def get_sb():
-    return create_client(secret("SUPABASE_URL"), secret("SUPABASE_KEY"))
+IS_ADMIN = USER_ID in ADMINS
 
 
 def get_rec(progress=None, config=None, exclude=None):
@@ -86,8 +147,11 @@ h2.caption(f"{USER_ID}님")
 if h2.button("로그아웃"):
     st.session_state.clear()
     st.rerun()
-tab_rec, tab_add, tab_lib, tab_want, tab_no = st.tabs(
-    ["추천받기", "책 기록하기", "내 서재", "읽고 싶은 책", "관심 없는 책"])
+tab_names = ["추천받기", "책 기록하기", "내 서재", "읽고 싶은 책", "관심 없는 책", "내 계정"]
+if IS_ADMIN:
+    tab_names.append("회원 관리")
+tabs = st.tabs(tab_names)
+tab_rec, tab_add, tab_lib, tab_want, tab_no, tab_me = tabs[:6]
 
 # ---------- 추천받기 ----------
 with tab_rec:
@@ -245,3 +309,74 @@ with tab_no:
                 get_rec().remove_feedback(isbn, "not_interested")
                 st.toast(f"다시 추천 후보가 돼요: {b.get('title')}")
                 st.rerun()
+
+# ---------- 내 계정 (비밀번호 바꾸기) ----------
+with tab_me:
+    st.subheader("비밀번호 바꾸기")
+    if USER_ID in SECRET_USERS:
+        st.info("이 계정은 Streamlit 설정(Secrets)에 등록된 계정이라, 비밀번호도 거기서 바꿔야 해요.")
+    elif db_users() is None:
+        st.info("아직 계정 저장 공간이 준비되지 않았어요. 관리자에게 알려주세요.")
+    else:
+        with st.form("change_pw", clear_on_submit=True):
+            cur = st.text_input("지금 비밀번호", type="password")
+            new1 = st.text_input("새 비밀번호 (4자 이상)", type="password")
+            new2 = st.text_input("새 비밀번호 한 번 더", type="password")
+            go = st.form_submit_button("바꾸기", type="primary")
+        if go:
+            if not login_ok(USER_ID, cur):
+                st.error("지금 비밀번호가 달라요.")
+            elif len(new1) < 4:
+                st.error("새 비밀번호는 4자 이상이어야 해요.")
+            elif new1 != new2:
+                st.error("새 비밀번호 두 개가 서로 달라요.")
+            else:
+                set_password(USER_ID, new1)
+                st.success("비밀번호를 바꿨어요. 다음 로그인부터 새 비밀번호를 쓰세요.")
+
+# ---------- 회원 관리 (관리자만) ----------
+if IS_ADMIN:
+    with tabs[6]:
+        users = db_users()
+        if users is None:
+            st.error("회원 저장용 테이블(app_users)이 아직 없어요. Supabase SQL Editor에서 한 번만 만들어 주세요.")
+            st.stop()
+
+        st.subheader("친구 추가")
+        with st.form("add_user", clear_on_submit=True):
+            new_id = st.text_input("아이디 (영어 소문자·숫자·_ , 2~20자)").strip().lower()
+            new_pw = st.text_input("비밀번호 (4자 이상)")
+            add = st.form_submit_button("추가하기", type="primary", use_container_width=True)
+        if add:
+            if not ID_RE.match(new_id):
+                st.error("아이디는 영어 소문자, 숫자, _ 만 쓸 수 있어요 (2~20자).")
+            elif new_id in users or new_id in SECRET_USERS:
+                st.error("이미 있는 아이디예요.")
+            elif len(new_pw) < 4:
+                st.error("비밀번호는 4자 이상이어야 해요.")
+            else:
+                set_password(new_id, new_pw)
+                st.success(f"추가했어요! 친구에게 아이디 **{new_id}** / 비밀번호 **{new_pw}** 를 알려주세요.")
+                users = db_users() or {}
+
+        st.subheader(f"사이트에서 등록한 회원 ({len(users)}명)")
+        if SECRET_USERS:
+            st.caption("Streamlit 설정에 있는 계정: " + ", ".join(SECRET_USERS) + " (여기서는 수정 불가)")
+        for uid, row in users.items():
+            with st.container(border=True):
+                st.markdown(f"**{uid}**")
+                c1, c2 = st.columns([3, 1])
+                pw_new = c1.text_input("새 비밀번호", key=f"rp_{uid}", label_visibility="collapsed",
+                                       placeholder="새 비밀번호 (재설정)")
+                if c2.button("재설정", key=f"rb_{uid}", use_container_width=True):
+                    if len(pw_new) < 4:
+                        st.error("비밀번호는 4자 이상이어야 해요.")
+                    else:
+                        set_password(uid, pw_new)
+                        st.success(f"{uid} 비밀번호를 바꿨어요.")
+                if uid != USER_ID:
+                    with st.popover("로그인 막기(삭제)"):
+                        st.write("이 아이디로 더 이상 로그인할 수 없게 돼요. 독서 기록은 남아 있어서, 같은 아이디로 다시 추가하면 복구돼요.")
+                        if st.button("삭제", key=f"del_{uid}", type="primary"):
+                            get_sb().table("app_users").delete().eq("user_id", uid).execute()
+                            st.rerun()
