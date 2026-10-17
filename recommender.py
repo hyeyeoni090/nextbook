@@ -62,6 +62,8 @@ DEFAULTS = {
 }
 
 FEW_BOOKS = 5   # 기록이 이보다 적으면 인기 대출 순위를 섞어서 추천
+MIN_POOL = 60   # 새 후보가 이보다 적으면 후보를 더 넓혀서 찾음
+FALLBACK_GENRES = ["소설(전체)", "에세이"]  # 후보가 모자랄 때 보충하는 분야
 COLD_GENRES = ["소설(전체)", "에세이", "사회과학", "심리학", "인생·처세"]  # 기록 없을 때 '전체' 모드 장르
 
 GENRES = {  # 도서관 분류번호(KDC) 기준
@@ -474,10 +476,11 @@ class Recommender:
         self.progress("비슷한 책 검색 중...")
         liked = u["liked"]
         queries = ([(a, "person") for a in sorted({a for s in liked["authors"] for a in s.split(", ") if a})]
-                   + [(kw, None) for kw in keywords_from(liked["contents"].tolist())])
-        for found in pmap(lambda q: self.kakao_search(q[0], target=q[1]), queries):
+                   + [(kw, None) for kw in keywords_from(liked["contents"].tolist(), n=15)])
+        for found in pmap(lambda q: self.kakao_search(q[0], target=q[1], size=50), queries):
             for b in found:
                 cands.setdefault(b["isbn13"], b)
+        self._expand_if_short(cands, collab, u)
         cands = {k: v for k, v in cands.items() if k not in u["skip"]}
         self.fill_contents(cands)
         pool = self.make_pool(cands, u, collab)
@@ -517,7 +520,24 @@ class Recommender:
                         break
             for g, d in topic:
                 results.append(self._result(d, g, is_new=author_of(d) not in u["read_authors"]))
-        return results, []
+
+        # 관심 분야 자리가 덜 찼으면 취향 후보로 마저 채움
+        if len(results) < top_n:
+            have = {norm_title(r.get("title")) for r in results}
+            for i in final.argsort()[::-1]:
+                if len(results) >= top_n:
+                    break
+                nt = norm_title(pool[i].get("title"))
+                if i in picked or nt in have:
+                    continue
+                have.add(nt)
+                results.append(self._result(pool[i], "취향", final[i], c[i], k[i],
+                                            author_of(pool[i]) not in u["read_authors"]))
+        warns = []
+        if len(results) < top_n:
+            warns.append(f"아직 안 본 추천 후보가 {len(results)}권뿐이에요. "
+                         "'이번에 이미 본 책은 빼고' 스위치를 끄거나 장르를 골라 보세요.")
+        return results, warns
 
     def _pick_simple(self, pool, final, n, u, cnt):
         cfg = self.cfg
@@ -540,8 +560,44 @@ class Recommender:
             if len(picked) >= n:
                 break
             try_pick(i)
+        # 그래도 모자라면 작가 권수 제한을 풀고 채움 (빈자리보다는 같은 작가 책이 낫다)
+        for i in order:
+            if len(picked) >= n:
+                break
+            if i not in picked:
+                picked.append(i)
+                cnt[author_of(pool[i])] += 1
         picked.sort(key=lambda i: -final[i])
         return picked
+
+    def _fresh_count(self, cands, u):
+        titles = set(u["skip_titles"])
+        n = 0
+        for k, b in cands.items():
+            nt = norm_title(b.get("title"))
+            if k not in u["skip"] and nt and nt not in titles:
+                titles.add(nt)
+                n += 1
+        return n
+
+    def _expand_if_short(self, cands, collab, u, need=MIN_POOL):
+        """새 후보가 부족하면 단계적으로 후보를 늘림
+        1) 함께 대출된 책의, 함께 대출된 책 (2단계)
+        2) 도서관 인기 대출 도서 (소설·에세이·관심 분야)"""
+        if self._fresh_count(cands, u) >= need:
+            return
+        self.progress("후보가 부족해서 더 찾는 중...")
+        seeds = [k for k, _ in collab.most_common(20)]
+        for seed, recs in zip(seeds, pmap(self.naru_recommend, seeds, workers=5)):
+            for rank, b in enumerate(recs, 1):
+                collab[b["isbn13"]] += 0.3 * collab[seed] / np.sqrt(rank)
+                cands.setdefault(b["isbn13"], b)
+        if self._fresh_count(cands, u) >= need:
+            return
+        for g in dict.fromkeys(FALLBACK_GENRES + list(self.cfg["TOPIC_GENRES"])):
+            if g in GENRES:
+                for b in self.naru_popular(GENRES[g], pages=3, days=self.cfg["GENRE_DAYS"]):
+                    cands.setdefault(b["isbn13"], b)
 
     # ---------- 장르 선택 모드 ----------
     def recommend_genre(self, names, balanced=True, top_n=10):
@@ -559,8 +615,18 @@ class Recommender:
         for g in names:
             self.progress(f"'{g}' 후보 모으는 중...")
             gcfg = GENRES[g]
-            for b in self.naru_popular(gcfg, pages=gcfg.get("pages", cfg["GENRE_PAGES"]),
-                                       days=cfg["GENRE_DAYS"], age=cfg["GENRE_AGE"]):
+            pages = gcfg.get("pages", cfg["GENRE_PAGES"])
+            # 키워드로 거르는 세부 장르는 걸러지는 비율이 높아서 더 많이 필요
+            need = MIN_POOL * (4 if gcfg.get("keywords") else 1)
+            while True:
+                found = self.naru_popular(gcfg, pages=pages, days=cfg["GENRE_DAYS"], age=cfg["GENRE_AGE"])
+                fresh = self._fresh_count({b["isbn13"]: b for b in found}, u)
+                # 이미 본·피드백 준 책이 많아 새 후보가 모자라면 더 아래 순위까지 (최대 2,000권)
+                if fresh >= need or pages >= 20:
+                    break
+                pages = min(pages * 2, 20)
+                self.progress(f"'{g}' 새 후보가 부족해서 더 찾는 중...")
+            for b in found:
                 pop[b["isbn13"]] = max(pop[b["isbn13"]], 1 / np.sqrt(b["rank"]))
                 cands.setdefault(b["isbn13"], b)
                 src.setdefault(b["isbn13"], set()).add(g)
@@ -624,6 +690,15 @@ class Recommender:
                 break
             if ok(i):
                 take(i)
+        # 그래도 모자라면 작가 권수 제한을 풀고 채움
+        for i in order:
+            if len(picked) >= top_n:
+                break
+            if i not in picked:
+                take(i)
+        if len(picked) < top_n:
+            warnings.append(f"이 장르에서 아직 안 본 책이 {len(picked)}권뿐이에요. "
+                            "'이번에 이미 본 책은 빼고' 스위치를 끄거나 장르를 넓혀 보세요.")
         picked = sorted(picked[:top_n], key=lambda i: -final[i])
 
         results = []
