@@ -22,3 +22,14 @@
 ## 파일 구성
 - `app.py` : Streamlit 화면
 - `recommender.py`
+
+## 실행 방법
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+API 키(카카오, 정보나루, Supabase)는 코드에 직접 넣지 않고 Streamlit Cloud의 Secrets에 저장해 `st.secrets`로 불러옵니다. 로컬 설정 파일(`.streamlit/secrets.toml`)은 `.gitignore`로 저장소에서 제외했고, 공개 저장소의 커밋 이력에도 키가 포함되지 않았습니다.
+
+## 개발 메모
+알라딘 API 서비스가 종료된 것을 확인하고 카카오 책 검색 API로 대체했습니다.
