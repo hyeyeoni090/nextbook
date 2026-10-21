@@ -1,1 +1,56 @@
+# 다음책 깨우기: 6시간마다 사이트와 DB를 자동으로 깨워서
+# Streamlit이 잠들거나(오븐 화면) Supabase가 7일 미사용으로 멈추는 걸 막음.
+name: keep-alive
 
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # 6시간마다 (UTC 기준 17분)
+  workflow_dispatch:          # Actions 화면에서 직접 실행 버튼
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Supabase 깨우기 (DB에 가벼운 조회 1번)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "apikey: $SUPABASE_KEY" \
+            "${SUPABASE_URL%/}/rest/v1/books?select=isbn13&limit=1")
+          echo "Supabase 응답: $code"
+          if [ "$code" != "200" ]; then
+            echo "::warning::Supabase가 200이 아님($code). 일시정지됐을 수 있으니 supabase.com에서 확인하세요."
+          fi
+
+      - name: 브라우저 준비
+        run: |
+          pip install -q playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Streamlit 사이트 깨우기
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+        run: |
+          python - <<'PY'
+          import os, re
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ["APP_URL"]
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page()
+              page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+              page.wait_for_timeout(8_000)
+              button = page.get_by_role("button", name=re.compile("get this app back up", re.I))
+              if button.count():
+                  print("잠들어 있어서 깨우는 중...")
+                  button.first.click()
+                  page.wait_for_timeout(90_000)  # 다시 켜지는 동안 기다림
+              else:
+                  print("이미 깨어 있음")
+                  page.wait_for_timeout(15_000)
+              browser.close()
+          PY
